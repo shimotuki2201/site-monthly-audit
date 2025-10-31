@@ -1,0 +1,50 @@
+name: Monthly Web QA
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'  # 毎月1日 00:00 UTC（日本時間 朝9時）
+  workflow_dispatch: {}  # 手動実行も可能
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm i -g pa11y-ci html-validate lighthouse @lhci/cli
+
+      - name: Build URL list
+        env:
+          SITE: ${{ secrets.SITE_URL }}
+        run: |
+          curl -fsSL "$SITE/sitemap.xml" -o sitemap.xml || true
+          grep -Eo '<loc>[^<]+' sitemap.xml | sed 's#<loc>##' > urls.txt || true
+          head -n 20 urls.txt > urls_final.txt
+          cat urls_final.txt
+
+      - name: Run Pa11y (Accessibility)
+        run: |
+          while read -r u; do
+            pa11y-ci "$u" || true
+          done < urls_final.txt
+
+      - name: Run HTML Validate
+        run: |
+          while read -r u; do
+            curl -fsSL "$u" | html-validate --stdin || true
+          done < urls_final.txt
+
+      - name: Run Lighthouse CI
+        run: |
+          mkdir -p reports
+          while read -r u; do
+            lhci autorun --collect.url="$u" --upload.target=filesystem --upload.outputDir=reports || true
+          done < urls_final.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monthly-audit-reports
+          path: reports/
