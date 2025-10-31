@@ -12,28 +12,23 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      # 1) リポジトリ取得
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # 2) Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # 3) 必要ツール
       - name: Install CLI tools
         run: |
           npm i -g pa11y-ci html-validate lighthouse @lhci/cli
           sudo apt-get update && sudo apt-get install -y jq
 
-      # 4) レポート出力先
       - name: Prepare reports folder
         run: |
           mkdir -p reports/lighthouse
 
-      # 5) URL リスト（urls.txt を優先、なければ停止しない）
       - name: Build URL list from urls.txt
         run: |
           if [ -f urls.txt ]; then
@@ -44,7 +39,6 @@ jobs:
           echo "=== URLs to audit ==="
           nl -ba urls_final.txt
 
-      # 6) Pa11y（アクセシビリティ）
       - name: Run Pa11y (Accessibility)
         run: |
           : > reports/pa11y.log
@@ -55,7 +49,6 @@ jobs:
             esac
           done < urls_final.txt
 
-      # 7) HTML Validate（構文）
       - name: Run HTML Validate
         run: |
           : > reports/htmlvalidate.log
@@ -66,7 +59,6 @@ jobs:
             esac
           done < urls_final.txt
 
-      # 8) Lighthouse（パフォーマンス/SEO 等）
       - name: Run Lighthouse
         run: |
           while read -r u; do
@@ -76,61 +68,57 @@ jobs:
             esac
           done < urls_final.txt
 
-      # 9) GPT で要約（YAML安全化版：jqで連結して作成）
+      # サイズ安全版: --rawfile でログを直接読み込む
       - name: Summarize logs with GPT (Markdown)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          # ログを軽くトリミング（巨大化対策）
-          head -n 4000 reports/pa11y.log > pa11y.trim.log || true
-          head -n 4000 reports/htmlvalidate.log > htmlvalidate.trim.log || true
+          head -n 2000 reports/pa11y.log > pa11y.trim.log || true
+          head -n 2000 reports/htmlvalidate.log > htmlvalidate.trim.log || true
+          head -c 120000 pa11y.trim.log > pa11y.trim2.log || true
+          head -c 120000 htmlvalidate.trim.log > htmlvalidate.trim2.log || true
 
-          # テキストを JSON 文字列へ
-          PA11Y=$(jq -Rs . < pa11y.trim.log)
-          HTMLV=$(jq -Rs . < htmlvalidate.trim.log)
+          jq -n \
+            --rawfile pa11y pa11y.trim2.log \
+            --rawfile html  htmlvalidate.trim2.log \
+            '{
+              "model": "gpt-4o-mini",
+              "messages": [
+                {"role": "system", "content": "You are a professional web quality auditor. Output concise Japanese Markdown."},
+                {"role": "user", "content":
+                  ("次の2つのログを要約して、Markdownで出力してください。\\n" +
+                   "- 1) pa11y.log（アクセシビリティ）\\n- 2) htmlvalidate.log（HTML構文）\\n\\n" +
+                   "要件：\\n" +
+                   "1) URLごとに主な問題を表形式で一覧化し、重要度(High/Medium/Low)を付与。\\n" +
+                   "2) よく出る共通の改善事項を箇条書きでまとめる。\\n" +
+                   "3) 修正例（HTML/ARIAなど）をコードブロックで示す。\\n" +
+                   "4) 優先度順に改善アクションを提案。\\n\\n" +
+                   "[pa11y.log]\\n" + $pa11y + "\\n\\n[htmlvalidate.log]\\n" + $html + "\\n")
+                }
+              ],
+              "max_tokens": 2000,
+              "temperature": 0.2
+            }' > payload.json
 
-          # jq で JSON を構築（文字列連結で安全に挿入）
-          jq -n --arg pa11y "$PA11Y" --arg html "$HTMLV" '{
-            "model": "gpt-4o-mini",
-            "messages": [
-              {"role": "system", "content": "You are a professional web quality auditor. Output concise Japanese Markdown."},
-              {"role": "user", "content":
-                ("次の2つのログを要約して、Markdownで出力してください。\\n" +
-                 "- 1) pa11y.log（アクセシビリティ）\\n- 2) htmlvalidate.log（HTML構文）\\n\\n" +
-                 "要件：\\n" +
-                 "1) URLごとに主な問題を表形式で一覧化し、重要度(High/Medium/Low)を付与。\\n" +
-                 "2) よく出る共通の改善事項を箇条書きでまとめる。\\n" +
-                 "3) 修正例（HTML/ARIAなど）をコードブロックで示す。\\n" +
-                 "4) 優先度順に改善アクションを提案。\\n\\n" +
-                 "[pa11y.log]\\n" + $pa11y + "\\n\\n[htmlvalidate.log]\\n" + $html + "\\n")
-              }
-            ],
-            "max_tokens": 2000,
-            "temperature": 0.2
-          }' > payload.json
-
-          # OpenAI API 呼び出し
           curl -s https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d @payload.json \
             | jq -r '.choices[0].message.content' > summary.md
 
-          # 体裁を整えた出力
           {
             echo "# 月次Web監査 AI要約"
             echo ""
             date -u +"実行時刻 (UTC): %Y-%m-%d %H:%M:%S"
             echo ""
             echo "## 解析対象ログ"
-            echo "- reports/pa11y.log"
-            echo "- reports/htmlvalidate.log"
+            echo "- reports/pa11y.log（先頭・約120KBを要約）"
+            echo "- reports/htmlvalidate.log（先頭・約120KBを要約）"
             echo ""
             echo "## 要約"
             cat summary.md || echo "_要約が取得できませんでした_"
           } > reports/SUMMARY_REPORT.md
 
-      # 10) 成果物アップロード
       - name: Upload audit artifacts
         uses: actions/upload-artifact@v4
         with:
