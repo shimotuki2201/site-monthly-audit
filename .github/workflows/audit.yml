@@ -1,124 +1,143 @@
 name: Monthly Web QA
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 0 1 * *' # 毎月1日 00:00 UTC（日本時間 朝9時）
 
 jobs:
   audit:
     name: Run monthly web audit
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
-      # コードをチェックアウト
+      # 1) リポジトリ取得
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Node.js のセットアップ
+      # 2) Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: '20'
 
-      # 監査ツールのインストール
-      - name: Install audit tools
+      # 3) 必要ツール
+      - name: Install CLI tools
         run: |
-          npm install -g pa11y-ci html-validate @lhci/cli
+          npm i -g pa11y-ci html-validate lighthouse @lhci/cli
+          sudo apt-get update && sudo apt-get install -y jq
 
-      # レポートフォルダを作成
+      # 4) レポート出力先
       - name: Prepare reports folder
-        run: mkdir -p reports
-
-      # URLリストを作成
-      - name: Build URL list
-        run: |
-          if [ -f urls.txt ]; then
-            cp urls.txt reports/urls.txt
-          else
-            echo "https://example.com/" > reports/urls.txt
-          fi
-          echo "✅ URL list ready:"
-          cat reports/urls.txt
-
-      # アクセシビリティ監査 (pa11y)
-      - name: Run Pa11y (Accessibility)
-        run: |
-          pa11y-ci --sitemap reports/urls.txt --sitemap-find " " --sitemap-replace " " > reports/pa11y.log || true
-
-      # HTML構文チェック
-      - name: Run HTML Validate
-        run: |
-          while read -r url; do
-            echo "Checking $url ..."
-            html-validate "$url" >> reports/htmlvalidate.log || true
-          done < reports/urls.txt
-
-      # Lighthouse CI（パフォーマンス・SEOなど）
-      - name: Run Lighthouse CI
         run: |
           mkdir -p reports/lighthouse
-          while read -r url; do
-            echo "Running Lighthouse for $url ..."
-            lhci collect --url="$url" --output-path="reports/lighthouse" || true
-          done < reports/urls.txt
 
-      # ===== ここから GPTによる要約 =====
-      - name: Summarize audit logs with GPT
+      # 5) URL リスト（urls.txt を優先、なければ停止しない）
+      - name: Build URL list from urls.txt
+        run: |
+          if [ -f urls.txt ]; then
+            head -n 30 urls.txt > urls_final.txt
+          else
+            echo "urls.txt が見つかりません。最低1本はURLを記入してください。" > urls_final.txt
+          fi
+          echo "=== URLs to audit ==="
+          nl -ba urls_final.txt
+
+      # 6) Pa11y（アクセシビリティ）
+      - name: Run Pa11y (Accessibility)
+        run: |
+          : > reports/pa11y.log
+          while read -r u; do
+            case "$u" in http* )
+              echo "pa11y: $u" | tee -a reports/pa11y.log
+              pa11y-ci "$u" >> reports/pa11y.log 2>&1 || true
+            esac
+          done < urls_final.txt
+
+      # 7) HTML Validate（構文）
+      - name: Run HTML Validate
+        run: |
+          : > reports/htmlvalidate.log
+          while read -r u; do
+            case "$u" in http* )
+              echo "html-validate: $u" | tee -a reports/htmlvalidate.log
+              curl -fsSL "$u" | html-validate --stdin >> reports/htmlvalidate.log 2>&1 || true
+            esac
+          done < urls_final.txt
+
+      # 8) Lighthouse（パフォーマンス/SEO 等）
+      - name: Run Lighthouse
+        run: |
+          while read -r u; do
+            case "$u" in http* )
+              echo "lighthouse: $u"
+              lhci collect --url="$u" --numberOfRuns=1 --outputDir=reports/lighthouse || true
+            esac
+          done < urls_final.txt
+
+      # 9) GPT で要約（YAML安全化版：jqで連結して作成）
+      - name: Summarize logs with GPT (Markdown)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          sudo apt-get update && sudo apt-get install -y jq
-
-          # ログをトリミング（重すぎ防止）
+          # ログを軽くトリミング（巨大化対策）
           head -n 4000 reports/pa11y.log > pa11y.trim.log || true
           head -n 4000 reports/htmlvalidate.log > htmlvalidate.trim.log || true
 
+          # テキストを JSON 文字列へ
           PA11Y=$(jq -Rs . < pa11y.trim.log)
           HTMLV=$(jq -Rs . < htmlvalidate.trim.log)
 
+          # jq で JSON を構築（文字列連結で安全に挿入）
           jq -n --arg pa11y "$PA11Y" --arg html "$HTMLV" '{
             "model": "gpt-4o-mini",
             "messages": [
-              {"role":"system","content":"You are a professional web quality auditor. Output concise Japanese Markdown."},
-              {"role":"user","content":
-"次の2つのログを要約して、Markdownで出力してください。\n\
-- 1) pa11y.log（アクセシビリティ）\n- 2) htmlvalidate.log（HTML構文）\n\n\
-要件：\n\
-1) URLごとに主な問題を表形式で一覧化し、重要度(High/Medium/Low)を付与。\n\
-2) よく出る共通の改善事項を箇条書きでまとめる。\n\
-3) 修正例（HTML/ARIAなど）をコードブロックで示す。\n\
-4) 優先度順に改善アクションを提案。\n\n\
-[pa11y.log]\n\($pa11y)\n\n[htmlvalidate.log]\n\($html)\n"}
+              {"role": "system", "content": "You are a professional web quality auditor. Output concise Japanese Markdown."},
+              {"role": "user", "content":
+                ("次の2つのログを要約して、Markdownで出力してください。\\n" +
+                 "- 1) pa11y.log（アクセシビリティ）\\n- 2) htmlvalidate.log（HTML構文）\\n\\n" +
+                 "要件：\\n" +
+                 "1) URLごとに主な問題を表形式で一覧化し、重要度(High/Medium/Low)を付与。\\n" +
+                 "2) よく出る共通の改善事項を箇条書きでまとめる。\\n" +
+                 "3) 修正例（HTML/ARIAなど）をコードブロックで示す。\\n" +
+                 "4) 優先度順に改善アクションを提案。\\n\\n" +
+                 "[pa11y.log]\\n" + $pa11y + "\\n\\n[htmlvalidate.log]\\n" + $html + "\\n")
+              }
             ],
             "max_tokens": 2000,
             "temperature": 0.2
           }' > payload.json
 
+          # OpenAI API 呼び出し
           curl -s https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d @payload.json \
             | jq -r '.choices[0].message.content' > summary.md
 
+          # 体裁を整えた出力
           {
-            echo "# 月次Web監査AI要約"
+            echo "# 月次Web監査 AI要約"
             echo ""
             date -u +"実行時刻 (UTC): %Y-%m-%d %H:%M:%S"
             echo ""
-            echo "## ログ概要"
-            echo "- pa11y.log"
-            echo "- htmlvalidate.log"
+            echo "## 解析対象ログ"
+            echo "- reports/pa11y.log"
+            echo "- reports/htmlvalidate.log"
             echo ""
             echo "## 要約"
-            cat summary.md
+            cat summary.md || echo "_要約が取得できませんでした_"
           } > reports/SUMMARY_REPORT.md
-      # ===== ここまで GPT =====
 
-      # 成果物をアップロード
+      # 10) 成果物アップロード
       - name: Upload audit artifacts
         uses: actions/upload-artifact@v4
         with:
           name: monthly-audit-reports
-          path: reports/
+          path: |
+            reports/
+            urls_final.txt
 
       - name: Upload GPT summary
         uses: actions/upload-artifact@v4
