@@ -16,6 +16,9 @@ jobs:
           node-version: '20'
       - run: npm i -g pa11y-ci html-validate lighthouse @lhci/cli
 
+      - name: Prepare reports folder  # ← この行を追加！
+        run: mkdir -p reports
+
       - name: Build URL list
         env:
           SITE: ${{ secrets.SITE_URL }}
@@ -28,18 +31,17 @@ jobs:
       - name: Run Pa11y (Accessibility)
         run: |
           while read -r u; do
-            pa11y-ci "$u" || true
+            pa11y-ci "$u" >> reports/pa11y.log || true
           done < urls_final.txt
 
       - name: Run HTML Validate
         run: |
           while read -r u; do
-            curl -fsSL "$u" | html-validate --stdin || true
+            curl -fsSL "$u" | html-validate --stdin >> reports/htmlvalidate.log || true
           done < urls_final.txt
 
       - name: Run Lighthouse CI
         run: |
-          mkdir -p reports
           while read -r u; do
             lhci autorun --collect.url="$u" --upload.target=filesystem --upload.outputDir=reports || true
           done < urls_final.txt
