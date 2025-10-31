@@ -1,9 +1,9 @@
 name: Monthly Web QA
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '0 0 1 * *'  # 毎月1日 00:00 UTC（日本時間 朝9時）
-  workflow_dispatch: {}  # 手動実行も可能
 
 jobs:
   audit:
@@ -11,42 +11,47 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm i -g pa11y-ci html-validate lighthouse @lhci/cli
 
-      - name: Prepare reports folder  # ← この行を追加！
-        run: mkdir -p reports
+      - name: Install CLI tools
+        run: npm i -g pa11y-ci html-validate lighthouse @lhci/cli
 
-      - name: Build URL list
-        env:
-          SITE: ${{ secrets.SITE_URL }}
+      - name: Prepare reports folder
+        run: mkdir -p reports/lighthouse
+
+      - name: Use urls.txt
         run: |
-          curl -fsSL "$SITE/sitemap.xml" -o sitemap.xml || true
-          grep -Eo '<loc>[^<]+' sitemap.xml | sed 's#<loc>##' > urls.txt || true
-          head -n 20 urls.txt > urls_final.txt
-          cat urls_final.txt
+          head -n 30 urls.txt > urls_final.txt
+          echo "=== URLs to audit ==="
+          nl -ba urls_final.txt
 
       - name: Run Pa11y (Accessibility)
         run: |
           while read -r u; do
-            pa11y-ci "$u" >> reports/pa11y.log || true
+            echo "pa11y: $u" | tee -a reports/pa11y.log
+            pa11y-ci "$u" >> reports/pa11y.log 2>&1 || true
           done < urls_final.txt
 
       - name: Run HTML Validate
         run: |
           while read -r u; do
-            curl -fsSL "$u" | html-validate --stdin >> reports/htmlvalidate.log || true
+            echo "html-validate: $u" | tee -a reports/htmlvalidate.log
+            curl -fsSL "$u" | html-validate --stdin >> reports/htmlvalidate.log 2>&1 || true
           done < urls_final.txt
 
-      - name: Run Lighthouse CI
+      - name: Run Lighthouse
         run: |
           while read -r u; do
-            lhci autorun --collect.url="$u" --upload.target=filesystem --upload.outputDir=reports || true
+            echo "lighthouse: $u"
+            lhci collect --url="$u" --numberOfRuns=1 --outputDir=reports/lighthouse || true
           done < urls_final.txt
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
         with:
           name: monthly-audit-reports
           path: reports/
